@@ -36,11 +36,11 @@ import (
 	"github.com/prometheus/tsdb"
 	tsdbLabels "github.com/prometheus/tsdb/labels"
 
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	pb "github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/retrieval"
 	"github.com/prometheus/prometheus/storage"
 )
 

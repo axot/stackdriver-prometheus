@@ -14,6 +14,7 @@
 package v1
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,12 +28,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
+	"github.com/gogo/protobuf/proto"
+	"github.com/golang/snappy"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/storage/remote"
 )
 
 type targetRetrieverFunc func() []*retrieval.Target
@@ -88,12 +95,25 @@ func TestEndpoints(t *testing.T) {
 		}
 	})
 
+	ar := alertmanagerRetrieverFunc(func() []*url.URL {
+		return []*url.URL{{
+			Scheme: "http",
+			Host:   "alertmanager.example.com:8080",
+			Path:   "/api/v1/alerts",
+		}}
+	})
+
 	api := &API{
-		targetRetriever: tr,
-		now:             func() time.Time { return now },
-		config:          func() config.Config { return samplePrometheusCfg },
-		ready:           func(f http.HandlerFunc) http.HandlerFunc { return f },
+		Queryable:             suite.Storage(),
+		QueryEngine:           suite.QueryEngine(),
+		targetRetriever:       tr,
+		alertmanagerRetriever: ar,
+		now:    func() time.Time { return now },
+		config: func() config.Config { return samplePrometheusCfg },
+		ready:  func(f http.HandlerFunc) http.HandlerFunc { return f },
 	}
+
+	start := time.Unix(0, 0)
 
 	var tests = []struct {
 		endpoint apiFunc
@@ -102,6 +122,304 @@ func TestEndpoints(t *testing.T) {
 		response interface{}
 		errType  errorType
 	}{
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query": []string{"2"},
+				"time":  []string{"123.4"},
+			},
+			response: &queryData{
+				ResultType: promql.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 2,
+					T: timestamp.FromTime(start.Add(123*time.Second + 400*time.Millisecond)),
+				},
+			},
+		},
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query": []string{"0.333"},
+				"time":  []string{"1970-01-01T00:02:03Z"},
+			},
+			response: &queryData{
+				ResultType: promql.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 0.333,
+					T: timestamp.FromTime(start.Add(123 * time.Second)),
+				},
+			},
+		},
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query": []string{"0.333"},
+				"time":  []string{"1970-01-01T01:02:03+01:00"},
+			},
+			response: &queryData{
+				ResultType: promql.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 0.333,
+					T: timestamp.FromTime(start.Add(123 * time.Second)),
+				},
+			},
+		},
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query": []string{"0.333"},
+			},
+			response: &queryData{
+				ResultType: promql.ValueTypeScalar,
+				Result: promql.Scalar{
+					V: 0.333,
+					T: timestamp.FromTime(now),
+				},
+			},
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"0"},
+				"end":   []string{"2"},
+				"step":  []string{"1"},
+			},
+			response: &queryData{
+				ResultType: promql.ValueTypeMatrix,
+				Result: promql.Matrix{
+					promql.Series{
+						Points: []promql.Point{
+							{V: 0, T: timestamp.FromTime(start)},
+							{V: 1, T: timestamp.FromTime(start.Add(1 * time.Second))},
+							{V: 2, T: timestamp.FromTime(start.Add(2 * time.Second))},
+						},
+						Metric: nil,
+					},
+				},
+			},
+		},
+		// Missing query params in range queries.
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"end":   []string{"2"},
+				"step":  []string{"1"},
+			},
+			errType: errorBadData,
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"0"},
+				"step":  []string{"1"},
+			},
+			errType: errorBadData,
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"0"},
+				"end":   []string{"2"},
+			},
+			errType: errorBadData,
+		},
+		// Bad query expression.
+		{
+			endpoint: api.query,
+			query: url.Values{
+				"query": []string{"invalid][query"},
+				"time":  []string{"1970-01-01T01:02:03+01:00"},
+			},
+			errType: errorBadData,
+		},
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"invalid][query"},
+				"start": []string{"0"},
+				"end":   []string{"100"},
+				"step":  []string{"1"},
+			},
+			errType: errorBadData,
+		},
+		// Invalid step.
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"1"},
+				"end":   []string{"2"},
+				"step":  []string{"0"},
+			},
+			errType: errorBadData,
+		},
+		// Start after end.
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"2"},
+				"end":   []string{"1"},
+				"step":  []string{"1"},
+			},
+			errType: errorBadData,
+		},
+		// Start overflows int64 internally.
+		{
+			endpoint: api.queryRange,
+			query: url.Values{
+				"query": []string{"time()"},
+				"start": []string{"148966367200.372"},
+				"end":   []string{"1489667272.372"},
+				"step":  []string{"1"},
+			},
+			errType: errorBadData,
+		},
+		{
+			endpoint: api.labelValues,
+			params: map[string]string{
+				"name": "__name__",
+			},
+			response: []string{
+				"test_metric1",
+				"test_metric2",
+			},
+		},
+		{
+			endpoint: api.labelValues,
+			params: map[string]string{
+				"name": "foo",
+			},
+			response: []string{
+				"bar",
+				"boo",
+			},
+		},
+		// Bad name parameter.
+		{
+			endpoint: api.labelValues,
+			params: map[string]string{
+				"name": "not!!!allowed",
+			},
+			errType: errorBadData,
+		},
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+		},
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric1{foo=~".+o"}`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+		},
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric1{foo=~".+o$"}`, `test_metric1{foo=~".+o"}`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+		},
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric1{foo=~".+o"}`, `none`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+		},
+		// Start and end before series starts.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"-2"},
+				"end":     []string{"-1"},
+			},
+			response: []labels.Labels{},
+		},
+		// Start and end after series ends.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"100000"},
+				"end":     []string{"100001"},
+			},
+			response: []labels.Labels{},
+		},
+		// Start before series starts, end after series ends.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"-1"},
+				"end":     []string{"100000"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+		},
+		// Start and end within series.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"1"},
+				"end":     []string{"100"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+		},
+		// Start within series, end after.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"1"},
+				"end":     []string{"100000"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+		},
+		// Start before series, end within series.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric2`},
+				"start":   []string{"-1"},
+				"end":     []string{"1"},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric2", "foo", "boo"),
+			},
+		},
+		// Missing match[] query params in series requests.
+		{
+			endpoint: api.series,
+			errType:  errorBadData,
+		},
+		{
+			endpoint: api.dropSeries,
+			errType:  errorInternal,
+		},
 		{
 			endpoint: api.targets,
 			response: &TargetDiscovery{
@@ -116,6 +434,16 @@ func TestEndpoints(t *testing.T) {
 			},
 		},
 		{
+			endpoint: api.alertmanagers,
+			response: &AlertmanagerDiscovery{
+				ActiveAlertmanagers: []*AlertmanagerTarget{
+					{
+						URL: "http://alertmanager.example.com:8080/api/v1/alerts",
+					},
+				},
+			},
+		},
+		{
 			endpoint: api.serveConfig,
 			response: &prometheusConfig{
 				YAML: samplePrometheusCfg.String(),
@@ -124,6 +452,10 @@ func TestEndpoints(t *testing.T) {
 	}
 
 	methods := func(f apiFunc) []string {
+		fp := reflect.ValueOf(f).Pointer()
+		if fp == reflect.ValueOf(api.query).Pointer() || fp == reflect.ValueOf(api.queryRange).Pointer() {
+			return []string{http.MethodGet, http.MethodPost}
+		}
 		return []string{http.MethodGet}
 	}
 
@@ -166,6 +498,102 @@ func TestEndpoints(t *testing.T) {
 				t.Fatalf("Response does not match, expected:\n%+v\ngot:\n%+v", test.response, resp)
 			}
 		}
+	}
+}
+
+func TestReadEndpoint(t *testing.T) {
+	suite, err := promql.NewTest(t, `
+		load 1m
+			test_metric1{foo="bar",baz="qux"} 1
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer suite.Close()
+
+	if err := suite.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	api := &API{
+		Queryable:   suite.Storage(),
+		QueryEngine: suite.QueryEngine(),
+		config: func() config.Config {
+			return config.Config{
+				GlobalConfig: config.GlobalConfig{
+					ExternalLabels: model.LabelSet{
+						"baz": "a",
+						"b":   "c",
+						"d":   "e",
+					},
+				},
+			}
+		},
+	}
+
+	// Encode the request.
+	matcher1, err := labels.NewMatcher(labels.MatchEqual, "__name__", "test_metric1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	matcher2, err := labels.NewMatcher(labels.MatchEqual, "d", "e")
+	if err != nil {
+		t.Fatal(err)
+	}
+	query, err := remote.ToQuery(0, 1, []*labels.Matcher{matcher1, matcher2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &prompb.ReadRequest{Queries: []*prompb.Query{query}}
+	data, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := snappy.Encode(nil, data)
+	request, err := http.NewRequest("POST", "", bytes.NewBuffer(compressed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	api.remoteRead(recorder, request)
+
+	// Decode the response.
+	compressed, err = ioutil.ReadAll(recorder.Result().Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncompressed, err := snappy.Decode(nil, compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var resp prompb.ReadResponse
+	err = proto.Unmarshal(uncompressed, &resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(resp.Results) != 1 {
+		t.Fatalf("Expected 1 result, got %d", len(resp.Results))
+	}
+
+	result := resp.Results[0]
+	expected := &prompb.QueryResult{
+		Timeseries: []*prompb.TimeSeries{
+			{
+				Labels: []*prompb.Label{
+					{Name: "__name__", Value: "test_metric1"},
+					{Name: "b", Value: "c"},
+					{Name: "baz", Value: "qux"},
+					{Name: "d", Value: "e"},
+					{Name: "foo", Value: "bar"},
+				},
+				Samples: []*prompb.Sample{{Value: 1, Timestamp: 0}},
+			},
+		},
+	}
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("Expected response \n%v\n but got \n%v\n", result, expected)
 	}
 }
 

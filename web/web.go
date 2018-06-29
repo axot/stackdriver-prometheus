@@ -17,9 +17,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	stdlog "log"
 	"net"
 	"net/http"
@@ -39,24 +39,30 @@ import (
 	pprof_runtime "runtime/pprof"
 	template_text "text/template"
 
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
-	api_v1 "github.com/Stackdriver/stackdriver-prometheus/web/api/v1"
-	"github.com/Stackdriver/stackdriver-prometheus/web/ui"
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/cockroachdb/cmux"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	conntrack "github.com/mwitkow/go-conntrack"
+	"github.com/mwitkow/go-conntrack"
 	"github.com/opentracing-contrib/go-stdlib/nethttp"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/tsdb"
+	"golang.org/x/net/netutil"
+
+	api_v1 "github.com/axot/stackdriver-prometheus/web/api/v1"
+	api_v2 "github.com/axot/stackdriver-prometheus/web/api/v2"
+	"github.com/axot/stackdriver-prometheus/web/ui"
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/template"
-	"golang.org/x/net/netutil"
+	"github.com/prometheus/prometheus/util/httputil"
 )
 
 var localhostRepresentations = []string{"127.0.0.1", "localhost"}
@@ -66,7 +72,12 @@ type Handler struct {
 	logger log.Logger
 
 	scrapeManager *retrieval.ScrapeManager
+	ruleManager   *rules.Manager
+	queryEngine   *promql.Engine
 	context       context.Context
+	tsdb          func() *tsdb.DB
+	storage       storage.Storage
+	notifier      *notifier.Notifier
 
 	apiV1 *api_v1.API
 
@@ -111,19 +122,27 @@ type PrometheusVersion struct {
 // Options for the web Handler.
 type Options struct {
 	Context       context.Context
+	TSDB          func() *tsdb.DB
+	Storage       storage.Storage
+	QueryEngine   *promql.Engine
 	ScrapeManager *retrieval.ScrapeManager
+	RuleManager   *rules.Manager
+	Notifier      *notifier.Notifier
 	Version       *PrometheusVersion
 	Flags         map[string]string
 
-	ListenAddress   string
-	ReadTimeout     time.Duration
-	MaxConnections  int
-	ExternalURL     *url.URL
-	RoutePrefix     string
-	MetricsPath     string
-	UseLocalAssets  bool
-	UserAssetsPath  string
-	EnableLifecycle bool
+	ListenAddress        string
+	ReadTimeout          time.Duration
+	MaxConnections       int
+	ExternalURL          *url.URL
+	RoutePrefix          string
+	MetricsPath          string
+	UseLocalAssets       bool
+	UserAssetsPath       string
+	ConsoleTemplatesPath string
+	ConsoleLibrariesPath string
+	EnableLifecycle      bool
+	EnableAdminAPI       bool
 }
 
 // New initializes a new web Handler.
@@ -151,19 +170,26 @@ func New(logger log.Logger, o *Options) *Handler {
 
 		context:       o.Context,
 		scrapeManager: o.ScrapeManager,
+		ruleManager:   o.RuleManager,
+		queryEngine:   o.QueryEngine,
+		tsdb:          o.TSDB,
+		storage:       o.Storage,
+		notifier:      o.Notifier,
 
 		now: model.Now,
 
 		ready: 0,
 	}
 
-	h.apiV1 = api_v1.NewAPI(h.scrapeManager,
+	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, h.scrapeManager, h.notifier,
 		func() config.Config {
 			h.mtx.RLock()
 			defer h.mtx.RUnlock()
 			return *h.config
 		},
 		h.testReady,
+		h.options.TSDB,
+		h.options.EnableAdminAPI,
 	)
 
 	if o.RoutePrefix != "/" {
@@ -174,15 +200,20 @@ func New(logger log.Logger, o *Options) *Handler {
 		router = router.WithPrefix(o.RoutePrefix)
 	}
 
+	instrh := prometheus.InstrumentHandler
 	instrf := prometheus.InstrumentHandlerFunc
 	readyf := h.testReady
 
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, path.Join(o.ExternalURL.Path, "/targets"), http.StatusFound)
+		http.Redirect(w, r, path.Join(o.ExternalURL.Path, "/graph"), http.StatusFound)
 	})
 
+	router.Get("/alerts", readyf(instrf("alerts", h.alerts)))
+	router.Get("/graph", readyf(instrf("graph", h.graph)))
+	router.Get("/status", readyf(instrf("status", h.status)))
 	router.Get("/flags", readyf(instrf("flags", h.flags)))
 	router.Get("/config", readyf(instrf("config", h.serveConfig)))
+	router.Get("/rules", readyf(instrf("rules", h.rules)))
 	router.Get("/targets", readyf(instrf("targets", h.targets)))
 	router.Get("/version", readyf(instrf("version", h.version)))
 	router.Get("/service-discovery", readyf(instrf("servicediscovery", h.serviceDiscovery)))
@@ -190,6 +221,12 @@ func New(logger log.Logger, o *Options) *Handler {
 	router.Get("/heap", instrf("heap", h.dumpHeap))
 
 	router.Get("/metrics", prometheus.Handler().ServeHTTP)
+
+	router.Get("/federate", readyf(instrh("federate", httputil.CompressionHandler{
+		Handler: http.HandlerFunc(h.federation),
+	})))
+
+	router.Get("/consoles/*filepath", readyf(instrf("consoles", h.consoles)))
 
 	router.Get("/static/*filepath", instrf("static", h.serveStaticAsset))
 
@@ -232,6 +269,20 @@ func New(logger log.Logger, o *Options) *Handler {
 	}))
 
 	return h
+}
+
+var corsHeaders = map[string]string{
+	"Access-Control-Allow-Headers":  "Accept, Authorization, Content-Type, Origin",
+	"Access-Control-Allow-Methods":  "GET, OPTIONS",
+	"Access-Control-Allow-Origin":   "*",
+	"Access-Control-Expose-Headers": "Date",
+}
+
+// Enables cross-site script calls.
+func setCORS(w http.ResponseWriter) {
+	for h, v := range corsHeaders {
+		w.Header().Set(h, v)
+	}
 }
 
 func serveDebug(w http.ResponseWriter, req *http.Request) {
@@ -348,6 +399,27 @@ func (h *Handler) Run(ctx context.Context) error {
 		httpl   = m.Match(cmux.HTTP1Fast())
 		grpcSrv = grpc.NewServer()
 	)
+	av2 := api_v2.New(
+		time.Now,
+		h.options.TSDB,
+		h.options.QueryEngine,
+		h.options.Storage.Querier,
+		func() []*retrieval.Target {
+			return h.options.ScrapeManager.Targets()
+		},
+		func() []*url.URL {
+			return h.options.Notifier.Alertmanagers()
+		},
+		h.options.EnableAdminAPI,
+	)
+	av2.RegisterGRPC(grpcSrv)
+
+	hh, err := av2.HTTPHandler(h.options.ListenAddress)
+	if err != nil {
+		return err
+	}
+
+	hhFunc := h.testReadyHandler(hh)
 
 	operationName := nethttp.OperationNameFunc(func(r *http.Request) string {
 		return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
@@ -364,6 +436,13 @@ func (h *Handler) Run(ctx context.Context) error {
 	}
 
 	mux.Handle(apiPath+"/v1/", http.StripPrefix(apiPath+"/v1", av1))
+
+	mux.Handle(apiPath+"/", http.StripPrefix(apiPath,
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			setCORS(w)
+			hhFunc(w, r)
+		}),
+	))
 
 	errlog := stdlog.New(log.NewStdlibAdapter(level.Error(h.logger)), "", 0)
 
@@ -399,6 +478,98 @@ func (h *Handler) Run(ctx context.Context) error {
 	}
 }
 
+func (h *Handler) alerts(w http.ResponseWriter, r *http.Request) {
+	alerts := h.ruleManager.AlertingRules()
+	alertsSorter := byAlertStateAndNameSorter{alerts: alerts}
+	sort.Sort(alertsSorter)
+
+	alertStatus := AlertStatus{
+		AlertingRules: alertsSorter.alerts,
+		AlertStateToRowClass: map[rules.AlertState]string{
+			rules.StateInactive: "success",
+			rules.StatePending:  "warning",
+			rules.StateFiring:   "danger",
+		},
+	}
+	h.executeTemplate(w, "alerts.html", alertStatus)
+}
+
+func (h *Handler) consoles(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	name := route.Param(ctx, "filepath")
+
+	file, err := http.Dir(h.options.ConsoleTemplatesPath).Open(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	text, err := ioutil.ReadAll(file)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Provide URL parameters as a map for easy use. Advanced users may have need for
+	// parameters beyond the first, so provide RawParams.
+	rawParams, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	params := map[string]string{}
+	for k, v := range rawParams {
+		params[k] = v[0]
+	}
+	data := struct {
+		RawParams url.Values
+		Params    map[string]string
+		Path      string
+	}{
+		RawParams: rawParams,
+		Params:    params,
+		Path:      strings.TrimLeft(name, "/"),
+	}
+
+	tmpl := template.NewTemplateExpander(
+		h.context,
+		string(text),
+		"__console_"+name,
+		data,
+		h.now(),
+		template.QueryFunc(rules.EngineQueryFunc(h.queryEngine)),
+		h.options.ExternalURL,
+	)
+	filenames, err := filepath.Glob(h.options.ConsoleLibrariesPath + "/*.lib")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result, err := tmpl.ExpandHTML(filenames)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	io.WriteString(w, result)
+}
+
+func (h *Handler) graph(w http.ResponseWriter, r *http.Request) {
+	h.executeTemplate(w, "graph.html", nil)
+}
+
+func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+	h.executeTemplate(w, "status.html", struct {
+		Birth         time.Time
+		CWD           string
+		Version       *PrometheusVersion
+		Alertmanagers []*url.URL
+	}{
+		Birth:         h.birth,
+		CWD:           h.cwd,
+		Version:       h.versionInfo,
+		Alertmanagers: h.notifier.Alertmanagers(),
+	})
+}
+
 func (h *Handler) flags(w http.ResponseWriter, r *http.Request) {
 	h.executeTemplate(w, "flags.html", h.flagsMap)
 }
@@ -408,6 +579,10 @@ func (h *Handler) serveConfig(w http.ResponseWriter, r *http.Request) {
 	defer h.mtx.RUnlock()
 
 	h.executeTemplate(w, "config.html", h.config.String())
+}
+
+func (h *Handler) rules(w http.ResponseWriter, r *http.Request) {
+	h.executeTemplate(w, "rules.html", h.ruleManager)
 }
 
 func (h *Handler) serviceDiscovery(w http.ResponseWriter, r *http.Request) {
@@ -468,12 +643,24 @@ func (h *Handler) reload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func tmplFuncs(opts *Options) template_text.FuncMap {
+func (h *Handler) consolesPath() string {
+	if _, err := os.Stat(h.options.ConsoleTemplatesPath + "/index.html"); !os.IsNotExist(err) {
+		return h.options.ExternalURL.Path + "/consoles/index.html"
+	}
+	if h.options.UserAssetsPath != "" {
+		if _, err := os.Stat(h.options.UserAssetsPath + "/index.html"); !os.IsNotExist(err) {
+			return h.options.ExternalURL.Path + "/user/index.html"
+		}
+	}
+	return ""
+}
+
+func tmplFuncs(consolesPath string, opts *Options) template_text.FuncMap {
 	return template_text.FuncMap{
 		"since": func(t time.Time) time.Duration {
 			return time.Since(t) / time.Millisecond * time.Millisecond
 		},
-		"consolesPath": func() string { return "" /* no console support */ },
+		"consolesPath": func() string { return consolesPath },
 		"pathPrefix":   func() string { return opts.ExternalURL.Path },
 		"buildVersion": func() string { return opts.Version.Revision },
 		"stripLabels": func(lset map[string]string, labels ...string) map[string]string {
@@ -567,10 +754,6 @@ func (h *Handler) getTemplate(name string) (string, error) {
 	return string(baseTmpl) + string(pageTmpl), nil
 }
 
-func nopQueryFunc(context.Context, string, time.Time) (promql.Vector, error) {
-	return nil, errors.New("'query' is unsupported")
-}
-
 func (h *Handler) executeTemplate(w http.ResponseWriter, name string, data interface{}) {
 	text, err := h.getTemplate(name)
 	if err != nil {
@@ -583,10 +766,10 @@ func (h *Handler) executeTemplate(w http.ResponseWriter, name string, data inter
 		name,
 		data,
 		h.now(),
-		template.QueryFunc(nopQueryFunc),
+		template.QueryFunc(rules.EngineQueryFunc(h.queryEngine)),
 		h.options.ExternalURL,
 	)
-	tmpl.Funcs(tmplFuncs(h.options))
+	tmpl.Funcs(tmplFuncs(h.consolesPath(), h.options))
 
 	result, err := tmpl.ExpandHTML(nil)
 	if err != nil {
@@ -606,4 +789,28 @@ func (h *Handler) dumpHeap(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	pprof_runtime.WriteHeapProfile(f)
 	fmt.Fprintf(w, "Done")
+}
+
+// AlertStatus bundles alerting rules and the mapping of alert states to row classes.
+type AlertStatus struct {
+	AlertingRules        []*rules.AlertingRule
+	AlertStateToRowClass map[rules.AlertState]string
+}
+
+type byAlertStateAndNameSorter struct {
+	alerts []*rules.AlertingRule
+}
+
+func (s byAlertStateAndNameSorter) Len() int {
+	return len(s.alerts)
+}
+
+func (s byAlertStateAndNameSorter) Less(i, j int) bool {
+	return s.alerts[i].State() > s.alerts[j].State() ||
+		(s.alerts[i].State() == s.alerts[j].State() &&
+			s.alerts[i].Name() < s.alerts[j].Name())
+}
+
+func (s byAlertStateAndNameSorter) Swap(i, j int) {
+	s.alerts[i], s.alerts[j] = s.alerts[j], s.alerts[i]
 }

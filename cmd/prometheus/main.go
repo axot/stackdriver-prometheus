@@ -42,9 +42,9 @@ import (
 	"github.com/prometheus/common/version"
 	k8s_runtime "k8s.io/apimachinery/pkg/util/runtime"
 
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
-	"github.com/Stackdriver/stackdriver-prometheus/stackdriver"
-	"github.com/Stackdriver/stackdriver-prometheus/web"
+	"github.com/axot/stackdriver-prometheus/retrieval"
+	"github.com/axot/stackdriver-prometheus/stackdriver"
+	"github.com/axot/stackdriver-prometheus/web"
 	"github.com/prometheus/common/promlog"
 	promlogflag "github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/prometheus/config"

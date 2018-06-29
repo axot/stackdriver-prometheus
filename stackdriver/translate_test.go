@@ -23,7 +23,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/go-kit/kit/log"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/protobuf/ptypes/timestamp"

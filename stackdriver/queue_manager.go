@@ -18,8 +18,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Stackdriver/stackdriver-prometheus/relabel"
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
+	"github.com/axot/stackdriver-prometheus/relabel"
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/gogo/protobuf/proto"

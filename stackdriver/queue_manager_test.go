@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Stackdriver/stackdriver-prometheus/retrieval"
+	"github.com/axot/stackdriver-prometheus/retrieval"
 	"github.com/gogo/protobuf/proto"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/model"
